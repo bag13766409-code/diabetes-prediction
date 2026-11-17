@@ -6,9 +6,9 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
@@ -32,42 +32,60 @@ st.set_page_config(
 )
 
 st.title("🩺 건강검진 데이터로 당뇨병 발병 여부 예측하기")
-st.caption("건강검진 데이터를 탐색하고 당뇨병 발병 여부를 예측하는 실습 앱입니다.")
 
-KAGGLE_DOWNLOAD_URL = (
+st.write(
+    "건강검진 데이터를 탐색하고 "
+    "당뇨병 발병 여부를 예측하는 실습 앱입니다."
+)
+
+DATA_URL = (
     "https://www.kaggle.com/api/v1/datasets/download/"
     "ehababoelnaga/diabetes-dataset"
 )
 
 ALIASES = {
-    "나이": ["age", "나이"],
-    "성별": ["gender", "sex", "성별"],
-    "혈당": ["glucose", "blood glucose", "blood_glucose", "혈당"],
-    "BMI": ["bmi", "체질량지수"],
-    "혈압": ["bloodpressure", "blood pressure", "blood_pressure", "혈압"],
+    "나이": ["age"],
+    "성별": ["gender", "sex"],
+    "혈당": ["glucose"],
+    "BMI": ["bmi"],
+    "혈압": ["bloodpressure", "blood pressure", "blood_pressure"],
     "당뇨병 발병 여부": [
-        "diabetes", "outcome", "class", "target",
-        "diagnosis", "당뇨병", "당뇨 여부"
+        "diabetes", "outcome", "class", "target"
     ]
 }
 
 
+# --------------------------------------------------
+# 데이터 관련 함수
+# --------------------------------------------------
+
 def normalize_name(name):
-    return str(name).strip().lower().replace("_", " ").replace("-", " ")
+    return (
+        str(name).strip().lower()
+        .replace("_", " ")
+        .replace("-", " ")
+    )
 
 
 def find_column(columns, candidates):
-    normalized = {normalize_name(c): c for c in columns}
+    normalized = {
+        normalize_name(c): c for c in columns
+    }
 
     for candidate in candidates:
         key = normalize_name(candidate)
+
         if key in normalized:
             return normalized[key]
 
-    compact = {k.replace(" ", ""): v for k, v in normalized.items()}
+    compact = {
+        k.replace(" ", ""): v
+        for k, v in normalized.items()
+    }
 
     for candidate in candidates:
         key = normalize_name(candidate).replace(" ", "")
+
         if key in compact:
             return compact[key]
 
@@ -75,111 +93,201 @@ def find_column(columns, candidates):
 
 
 def read_csv_bytes(raw_bytes):
-    for encoding in ("utf-8", "utf-8-sig", "cp949", "latin1"):
+    for encoding in ["utf-8", "utf-8-sig", "cp949", "latin1"]:
         try:
-            return pd.read_csv(io.BytesIO(raw_bytes), encoding=encoding)
+            return pd.read_csv(
+                io.BytesIO(raw_bytes),
+                encoding=encoding
+            )
         except Exception:
             pass
 
     raise ValueError("CSV 파일을 읽을 수 없습니다.")
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def download_kaggle_dataset():
-    response = requests.get(KAGGLE_DOWNLOAD_URL, timeout=35)
+@st.cache_data(ttl=3600)
+def download_data():
+    response = requests.get(
+        DATA_URL,
+        timeout=40
+    )
+
     response.raise_for_status()
 
     content = response.content
 
     if zipfile.is_zipfile(io.BytesIO(content)):
+
         with zipfile.ZipFile(io.BytesIO(content)) as archive:
 
-            csv_names = [
+            files = [
                 name for name in archive.namelist()
                 if name.lower().endswith(".csv")
                 and not name.startswith("__MACOSX")
             ]
 
-            if not csv_names:
-                raise ValueError("압축 파일에서 CSV를 찾지 못했습니다.")
+            if not files:
+                raise ValueError("CSV 파일을 찾지 못했습니다.")
 
             preferred = [
-                name for name in csv_names
-                if any(word in name.lower()
-                       for word in ("training", "train", "diabetes"))
+                name for name in files
+                if any(
+                    word in name.lower()
+                    for word in ["training", "train", "diabetes"]
+                )
             ]
 
-            chosen = preferred[0] if preferred else csv_names[0]
+            filename = preferred[0] if preferred else files[0]
 
-            with archive.open(chosen) as file:
+            with archive.open(filename) as file:
                 df = read_csv_bytes(file.read())
 
-            return df, chosen
+            return df, filename
 
     return read_csv_bytes(content), "Kaggle CSV"
 
 
-def prepare_binary_target(series):
-    values = series.dropna().astype(str).str.strip()
-    unique_values = list(pd.unique(values))
+def convert_target(series):
+    """
+    당뇨병 여부를 0과 1로 변환합니다.
+    0 = 정상
+    1 = 당뇨병
+    """
 
-    if len(unique_values) != 2:
+    values = series.dropna().astype(str).str.strip()
+    unique = list(pd.unique(values))
+
+    if len(unique) != 2:
         raise ValueError(
-            f"목표값은 두 종류여야 합니다. 현재 {len(unique_values)}종류입니다."
+            "당뇨병 여부 컬럼에는 두 종류의 값이 있어야 합니다."
         )
 
     positive_words = [
-        "1", "yes", "y", "true", "positive",
-        "diabetes", "diabetic", "당뇨", "당뇨병", "발병"
+        "1", "yes", "true", "positive",
+        "diabetes", "diabetic"
     ]
 
     negative_words = [
-        "0", "no", "n", "false", "negative",
-        "normal", "non-diabetic", "non diabetic",
-        "정상", "비당뇨"
+        "0", "no", "false", "negative",
+        "normal", "non-diabetic"
     ]
 
     positive = None
     negative = None
 
-    for value in unique_values:
-        low = value.lower()
+    for value in unique:
 
-        if low in positive_words:
+        if value.lower() in positive_words:
             positive = value
 
-        if low in negative_words:
+        if value.lower() in negative_words:
             negative = value
 
     if positive is not None and negative is not None:
+
         mapping = {
             negative: 0,
             positive: 1
         }
 
     else:
-        try:
-            numeric_values = sorted(float(v) for v in unique_values)
 
-            if numeric_values == [0.0, 1.0]:
-                mapping = {v: int(float(v)) for v in unique_values}
+        try:
+            numbers = sorted(float(v) for v in unique)
+
+            if numbers == [0.0, 1.0]:
+                mapping = {
+                    v: int(float(v))
+                    for v in unique
+                }
             else:
-                ordered = sorted(unique_values)
+                ordered = sorted(unique)
                 mapping = {
                     ordered[0]: 0,
                     ordered[1]: 1
                 }
 
         except Exception:
-            ordered = sorted(unique_values)
+            ordered = sorted(unique)
+
             mapping = {
                 ordered[0]: 0,
                 ordered[1]: 1
             }
 
-    converted = series.astype(str).str.strip().map(mapping)
+    converted = (
+        series.astype(str)
+        .str.strip()
+        .map(mapping)
+    )
 
     return converted, mapping
+
+
+def make_groups(series, bins):
+    """
+    숫자형 변수는 분위수 기준으로 구간을 나눕니다.
+    """
+
+    numeric = pd.to_numeric(
+        series,
+        errors="coerce"
+    )
+
+    if numeric.notna().sum() == 0:
+        return series.fillna("정보 없음").astype(str)
+
+    if numeric.nunique() <= 1:
+        return numeric.astype(str)
+
+    try:
+        grouped = pd.qcut(
+            numeric,
+            q=bins,
+            duplicates="drop"
+        )
+
+    except Exception:
+        grouped = pd.cut(
+            numeric,
+            bins=bins,
+            duplicates="drop"
+        )
+
+    return grouped.astype(str).replace(
+        "nan",
+        "정보 없음"
+    ).fillna("정보 없음")
+
+
+def diabetes_rate_table(data, group_column):
+    """
+    그룹별 전체 인원, 당뇨병 환자 수, 발병 비율 계산
+    """
+
+    result = data.groupby(
+        group_column,
+        observed=True
+    )["_target"].agg(
+        전체_인원="count",
+        당뇨병_환자수="sum"
+    ).reset_index()
+
+    result["당뇨병_발병_비율(%)"] = (
+        result["당뇨병_환자수"]
+        / result["전체_인원"]
+        * 100
+    )
+
+    result["당뇨병_환자수"] = (
+        result["당뇨병_환자수"].astype(int)
+    )
+
+    result["당뇨병_발병_비율(%)"] = (
+        result["당뇨병_발병_비율(%)"].round(1)
+    )
+
+    return result
 
 
 # --------------------------------------------------
@@ -188,18 +296,13 @@ def prepare_binary_target(series):
 
 st.sidebar.header("📂 데이터 준비")
 
-st.sidebar.write(
-    "Kaggle에서 데이터를 자동으로 불러옵니다. "
-    "자동 다운로드가 안 되면 CSV 파일을 직접 올려 주세요."
-)
-
-uploaded_file = st.sidebar.file_uploader(
+uploaded = st.sidebar.file_uploader(
     "CSV 파일 직접 업로드",
     type=["csv"]
 )
 
-load_mode = st.sidebar.radio(
-    "데이터 불러오기 방법",
+mode = st.sidebar.radio(
+    "데이터 불러오기",
     [
         "Kaggle에서 자동 불러오기",
         "CSV 파일 직접 업로드"
@@ -207,95 +310,114 @@ load_mode = st.sidebar.radio(
 )
 
 df = None
-source_text = ""
 
-if load_mode == "CSV 파일 직접 업로드":
+if mode == "Kaggle에서 자동 불러오기":
 
-    if uploaded_file is not None:
-        try:
-            df = read_csv_bytes(uploaded_file.getvalue())
-            source_text = uploaded_file.name
+    try:
+        with st.spinner("데이터를 불러오는 중입니다..."):
+            df, source = download_data()
 
-        except Exception as e:
-            st.error(f"파일을 읽는 중 문제가 발생했습니다: {e}")
+    except Exception as e:
+
+        st.sidebar.error(
+            "Kaggle 자동 다운로드에 실패했습니다."
+        )
+
+        st.sidebar.caption(str(e))
+
+        st.sidebar.markdown(
+            "[Kaggle 데이터 다운로드](https://www.kaggle.com/datasets/ehababoelnaga/diabetes-dataset)"
+        )
+
+        if uploaded is not None:
+            df = read_csv_bytes(uploaded.getvalue())
 
 else:
 
-    with st.spinner("Kaggle 데이터를 불러오는 중입니다..."):
-
-        try:
-            df, source_text = download_kaggle_dataset()
-
-        except Exception as e:
-
-            st.warning(
-                "Kaggle에서 자동으로 데이터를 가져오지 못했습니다. "
-                "CSV 파일을 다운로드한 뒤 직접 업로드해 주세요."
-            )
-
-            st.caption(f"오류 내용: {e}")
-
-            st.markdown(
-                "[Kaggle 당뇨병 데이터셋 열기]"
-                "(https://www.kaggle.com/datasets/ehababoelnaga/diabetes-dataset)"
-            )
-
-            if uploaded_file is not None:
-                try:
-                    df = read_csv_bytes(uploaded_file.getvalue())
-                    source_text = uploaded_file.name
-
-                except Exception as upload_error:
-                    st.error(f"업로드 오류: {upload_error}")
+    if uploaded is not None:
+        df = read_csv_bytes(uploaded.getvalue())
 
 
 if df is None:
-    st.info("데이터를 불러오면 분석 화면이 나타납니다.")
+    st.info(
+        "왼쪽 메뉴에서 CSV 파일을 업로드하거나 "
+        "Kaggle 자동 불러오기를 이용해 주세요."
+    )
     st.stop()
 
 
 df = df.copy()
-df.columns = [str(c).strip() for c in df.columns]
+
+df.columns = [
+    str(c).strip()
+    for c in df.columns
+]
+
 df = df.dropna(how="all")
 
-st.sidebar.success(f"데이터 불러오기 완료: {source_text}")
-st.sidebar.caption(
-    f"{len(df):,}행 × {len(df.columns):,}열"
+st.sidebar.success("데이터 불러오기 완료")
+
+st.sidebar.write(
+    f"전체 데이터: {len(df):,}명"
 )
 
 
-# 주요 컬럼 자동 탐색
+# --------------------------------------------------
+# 컬럼 확인
+# --------------------------------------------------
 
 detected = {
     label: find_column(df.columns, names)
     for label, names in ALIASES.items()
 }
 
-
-# 목표 컬럼 선택
-
 st.sidebar.divider()
-st.sidebar.subheader("분석에 사용할 컬럼")
+st.sidebar.subheader("분석 설정")
 
-target_candidates = list(df.columns)
+target_options = list(df.columns)
 
 default_target = detected["당뇨병 발병 여부"]
 
 target_index = (
-    target_candidates.index(default_target)
-    if default_target in target_candidates
+    target_options.index(default_target)
+    if default_target in target_options
     else 0
 )
 
 target_col = st.sidebar.selectbox(
-    "당뇨병 발병 여부 컬럼(정답)",
-    target_candidates,
+    "당뇨병 발병 여부 컬럼",
+    target_options,
     index=target_index
 )
 
 
 # --------------------------------------------------
-# 화면 구성
+# 목표값 변환
+# --------------------------------------------------
+
+try:
+    target, target_mapping = convert_target(
+        df[target_col]
+    )
+
+except Exception as e:
+    st.error(f"당뇨병 발병 여부 컬럼 오류: {e}")
+    st.stop()
+
+
+data = df.copy()
+
+data["_target"] = target
+
+data = data.dropna(
+    subset=["_target"]
+)
+
+data["_target"] = data["_target"].astype(int)
+
+
+# --------------------------------------------------
+# 탭 구성
 # --------------------------------------------------
 
 tab1, tab2, tab3, tab4 = st.tabs([
@@ -314,16 +436,20 @@ with tab1:
 
     st.header("1. 데이터 살펴보기")
 
-    st.write(
-        "데이터의 크기, 컬럼 이름, 자료형, 빈 값의 개수를 확인합니다."
-    )
-
     c1, c2, c3 = st.columns(3)
 
-    c1.metric("전체 데이터 수", f"{len(df):,}명")
-    c2.metric("속성(컬럼) 수", f"{len(df.columns):,}개")
+    c1.metric(
+        "전체 인원",
+        f"{len(df):,}명"
+    )
+
+    c2.metric(
+        "속성 개수",
+        f"{len(df.columns):,}개"
+    )
+
     c3.metric(
-        "빈 값이 있는 셀",
+        "빈 값 개수",
         f"{int(df.isna().sum().sum()):,}개"
     )
 
@@ -336,34 +462,38 @@ with tab1:
 
     st.subheader("컬럼별 정보")
 
-    meaning_map = {
+    meanings = {
         "나이": "건강검진을 받은 사람의 나이",
         "성별": "건강검진을 받은 사람의 성별",
-        "혈당": "혈액 속 포도당의 농도를 나타내는 수치",
+        "혈당": "혈액 속 포도당의 농도",
         "BMI": "키와 몸무게를 이용해 계산한 비만 정도",
         "혈압": "혈액이 혈관 벽에 가하는 압력",
         "당뇨병 발병 여부": "당뇨병 발병 여부(1: 당뇨병, 0: 정상)"
     }
 
-    description_rows = []
+    rows = []
 
     for col in df.columns:
 
         role = next(
-            (label for label, found in detected.items() if found == col),
+            (
+                label
+                for label, found in detected.items()
+                if found == col
+            ),
             ""
         )
 
-        description_rows.append({
+        rows.append({
             "컬럼명": col,
-            "우리말 뜻": meaning_map.get(role, ""),
-            "데이터 종류": str(df[col].dtype),
+            "우리말 뜻": meanings.get(role, ""),
+            "자료형": str(df[col].dtype),
             "빈 값 개수": int(df[col].isna().sum()),
-            "고유값 개수": int(df[col].nunique(dropna=True))
+            "고유값 개수": int(df[col].nunique())
         })
 
     st.dataframe(
-        pd.DataFrame(description_rows),
+        pd.DataFrame(rows),
         use_container_width=True,
         hide_index=True
     )
@@ -385,177 +515,289 @@ with tab2:
     st.header("2. 데이터 탐색하기")
 
     st.write(
-        "당뇨병 발병 여부에 따라 건강 지표의 분포가 "
-        "어떻게 달라지는지 살펴봅니다."
+        "독립 변수를 선택하면 해당 변수의 값에 따라 "
+        "당뇨병 발병 비율이 어떻게 달라지는지 확인할 수 있습니다."
     )
 
-    try:
-        target_numeric, target_mapping = prepare_binary_target(
-            df[target_col]
-        )
+    # 전체 당뇨병 비율
 
-    except Exception as e:
-        st.error(f"목표 컬럼을 확인해 주세요: {e}")
-        st.stop()
+    total_people = len(data)
 
-    valid_target = target_numeric.notna()
-
-    explore_df = df.loc[valid_target].copy()
-
-    explore_df["_당뇨병_숫자"] = (
-        target_numeric.loc[valid_target].astype(int)
+    diabetic_people = int(
+        data["_target"].sum()
     )
 
-    positive_count = int(
-        (explore_df["_당뇨병_숫자"] == 1).sum()
-    )
-
-    negative_count = int(
-        (explore_df["_당뇨병_숫자"] == 0).sum()
-    )
-
-    m1, m2, m3 = st.columns(3)
-
-    m1.metric("정상(0)", f"{negative_count:,}명")
-    m2.metric("당뇨병(1)", f"{positive_count:,}명")
-
-    ratio = (
-        positive_count / len(explore_df) * 100
-        if len(explore_df) > 0
+    total_rate = (
+        diabetic_people / total_people * 100
+        if total_people > 0
         else 0
     )
 
-    m3.metric("당뇨병 비율", f"{ratio:.1f}%")
+    c1, c2, c3 = st.columns(3)
 
-    st.caption(
-        f"목표값 변환 기준: {target_mapping} "
-        "(0=정상, 1=당뇨병)"
+    c1.metric(
+        "전체 인원",
+        f"{total_people:,}명"
     )
 
-    numeric_cols = explore_df.select_dtypes(
-        include=np.number
-    ).columns.tolist()
+    c2.metric(
+        "당뇨병 환자",
+        f"{diabetic_people:,}명"
+    )
 
-    numeric_cols = [
-        c for c in numeric_cols
-        if c != "_당뇨병_숫자"
+    c3.metric(
+        "전체 당뇨병 발병 비율",
+        f"{total_rate:.1f}%"
+    )
+
+    st.divider()
+
+    # 독립 변수 선택
+
+    st.subheader("① 분석할 독립 변수 선택")
+
+    feature_options = [
+        c for c in df.columns
+        if c != target_col
     ]
 
-    if numeric_cols:
+    default_features = []
 
-        preferred_order = [
-            detected["혈당"],
-            detected["BMI"],
-            detected["나이"],
-            detected["혈압"]
-        ]
+    for key in ["나이", "성별", "혈당", "BMI", "혈압"]:
 
-        preferred_order = [
-            c for c in preferred_order
-            if c in numeric_cols
-        ]
+        col = detected.get(key)
 
-        remaining = [
-            c for c in numeric_cols
-            if c not in preferred_order
-        ]
+        if col in feature_options:
+            default_features.append(col)
 
-        chart_cols = preferred_order + remaining
+    selected_features = st.multiselect(
+        "비교하고 싶은 독립 변수를 선택하세요.",
+        feature_options,
+        default=default_features
+    )
 
-        selected_feature = st.selectbox(
-            "분포를 확인할 숫자형 속성",
-            chart_cols
+    bins = st.slider(
+        "숫자형 변수의 구간 개수",
+        min_value=2,
+        max_value=10,
+        value=5
+    )
+
+    if not selected_features:
+
+        st.info(
+            "독립 변수를 한 개 이상 선택하면 "
+            "당뇨병 발병 비율을 분석할 수 있습니다."
         )
 
-        st.subheader(
-            f"정상과 당뇨병 그룹의 {selected_feature} 비교"
+    else:
+
+        st.divider()
+
+        st.subheader("② 독립 변수별 당뇨병 발병 비율")
+
+        st.caption(
+            "각 그룹에서 당뇨병 환자 수를 전체 인원으로 나누어 계산합니다."
         )
 
-        fig, ax = plt.subplots(figsize=(8, 4))
+        for feature in selected_features:
 
-        for label in [0, 1]:
+            st.markdown(f"### 📌 {feature}에 따른 당뇨병 발병 비율")
 
-            values = pd.to_numeric(
-                explore_df.loc[
-                    explore_df["_당뇨병_숫자"] == label,
-                    selected_feature
-                ],
+            temp = data[[feature, "_target"]].copy()
+
+            # 숫자형 변수인지 확인
+
+            numeric_values = pd.to_numeric(
+                temp[feature],
                 errors="coerce"
-            ).dropna()
+            )
 
-            if len(values):
+            is_numeric = (
+                numeric_values.notna().sum() > 0
+                and numeric_values.notna().sum()
+                >= temp[feature].notna().sum() * 0.8
+            )
 
-                ax.hist(
-                    values,
-                    bins=25,
-                    alpha=0.55,
-                    label="정상" if label == 0 else "당뇨병"
+            group_col = "_분석그룹"
+
+            if is_numeric:
+
+                temp[group_col] = make_groups(
+                    numeric_values,
+                    bins
                 )
 
-        ax.set_xlabel(selected_feature)
-        ax.set_ylabel("인원수")
-        ax.set_title(
-            f"정상과 당뇨병 그룹의 {selected_feature} 분포"
-        )
-        ax.legend()
+            else:
 
-        st.pyplot(fig)
-        plt.close(fig)
+                temp[group_col] = (
+                    temp[feature]
+                    .fillna("정보 없음")
+                    .astype(str)
+                )
 
-        st.subheader("당뇨병 여부에 따른 평균 비교")
-
-        means = explore_df.groupby(
-            "_당뇨병_숫자"
-        )[numeric_cols].mean().T
-
-        means = means.rename(
-            columns={
-                0: "정상 평균",
-                1: "당뇨병 평균"
-            }
-        )
-
-        st.dataframe(
-            means,
-            use_container_width=True
-        )
-
-        if len(numeric_cols) >= 2:
-
-            st.subheader("숫자형 속성 사이의 상관관계")
-
-            corr = explore_df[
-                numeric_cols + ["_당뇨병_숫자"]
-            ].corr(numeric_only=True)
-
-            fig, ax = plt.subplots(figsize=(9, 6))
-
-            image = ax.imshow(
-                corr,
-                cmap="coolwarm",
-                vmin=-1,
-                vmax=1
+            result = diabetes_rate_table(
+                temp,
+                group_col
             )
 
-            ax.set_xticks(range(len(corr.columns)))
-            ax.set_xticklabels(
-                corr.columns,
-                rotation=45,
-                ha="right"
+            result = result.rename(
+                columns={
+                    group_col: feature
+                }
             )
 
-            ax.set_yticks(range(len(corr.index)))
-            ax.set_yticklabels(corr.index)
+            # 표 출력
 
-            fig.colorbar(image, ax=ax)
-            ax.set_title("상관관계")
+            st.dataframe(
+                result,
+                use_container_width=True,
+                hide_index=True
+            )
+
+            # 그래프 출력
+
+            fig, ax = plt.subplots(figsize=(9, 4))
+
+            ax.bar(
+                result[feature].astype(str),
+                result["당뇨병_발병_비율(%)"]
+            )
+
+            ax.axhline(
+                total_rate,
+                linestyle="--",
+                label=f"전체 평균 {total_rate:.1f}%"
+            )
+
+            ax.set_title(
+                f"{feature}에 따른 당뇨병 발병 비율"
+            )
+
+            ax.set_xlabel(feature)
+            ax.set_ylabel("당뇨병 발병 비율 (%)")
+
+            ax.set_ylim(
+                0,
+                max(
+                    100,
+                    result["당뇨병_발병_비율(%)"].max() + 10
+                )
+            )
+
+            ax.tick_params(
+                axis="x",
+                rotation=35
+            )
+
+            ax.legend()
             fig.tight_layout()
 
             st.pyplot(fig)
             plt.close(fig)
 
-    else:
-        st.info("탐색할 숫자형 컬럼이 없습니다.")
+            st.divider()
+
+        # --------------------------------------------------
+        # 여러 독립 변수의 조합 분석
+        # --------------------------------------------------
+
+        st.subheader("③ 여러 독립 변수를 함께 분석하기")
+
+        st.write(
+            "선택한 독립 변수들을 조합했을 때 "
+            "각 조건에 해당하는 사람들의 당뇨병 발병 비율을 확인합니다."
+        )
+
+        use_combination = st.checkbox(
+            "선택한 독립 변수의 조합별 발병 비율도 확인하기"
+        )
+
+        if use_combination:
+
+            combo_data = data[
+                selected_features + ["_target"]
+            ].copy()
+
+            combo_columns = []
+
+            for feature in selected_features:
+
+                numeric_values = pd.to_numeric(
+                    combo_data[feature],
+                    errors="coerce"
+                )
+
+                is_numeric = (
+                    numeric_values.notna().sum() > 0
+                    and numeric_values.notna().sum()
+                    >= combo_data[feature].notna().sum() * 0.8
+                )
+
+                new_col = f"{feature}_그룹"
+
+                if is_numeric:
+
+                    combo_data[new_col] = make_groups(
+                        numeric_values,
+                        bins
+                    )
+
+                else:
+
+                    combo_data[new_col] = (
+                        combo_data[feature]
+                        .fillna("정보 없음")
+                        .astype(str)
+                    )
+
+                combo_columns.append(new_col)
+
+            combination_result = (
+                combo_data
+                .groupby(
+                    combo_columns,
+                    observed=True
+                )["_target"]
+                .agg(
+                    전체_인원="count",
+                    당뇨병_환자수="sum"
+                )
+                .reset_index()
+            )
+
+            combination_result["당뇨병_발병_비율(%)"] = (
+                combination_result["당뇨병_환자수"]
+                / combination_result["전체_인원"]
+                * 100
+            ).round(1)
+
+            combination_result = combination_result.sort_values(
+                "당뇨병_발병_비율(%)",
+                ascending=False
+            )
+
+            # 표에 보기 좋은 컬럼명 적용
+
+            combination_result = combination_result.rename(
+                columns={
+                    f"{feature}_그룹": feature
+                    for feature in selected_features
+                }
+            )
+
+            st.write("당뇨병 발병 비율이 높은 조합부터 표시합니다.")
+
+            st.dataframe(
+                combination_result.head(30),
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.caption(
+                "조합별 인원이 적으면 발병 비율이 크게 달라질 수 있습니다. "
+                "전체 인원도 함께 확인하세요."
+            )
 
 
 # ==================================================
@@ -567,59 +809,37 @@ with tab3:
     st.header("3. 분류 모델 만들기")
 
     st.write(
-        "데이터를 학습용과 시험용으로 나눈 뒤 "
-        "두 가지 분류 모델을 학습합니다."
+        "선택한 독립 변수를 이용하여 "
+        "당뇨병 발병 여부를 예측하는 모델을 만듭니다."
     )
 
-    st.caption(
+    st.info(
         "당뇨병(1)을 양성으로 설정합니다."
     )
 
-    model_df = df.copy()
-
-    try:
-        y_converted, mapping = prepare_binary_target(
-            model_df[target_col]
-        )
-
-    except Exception as e:
-        st.error(f"목표 컬럼 오류: {e}")
-        st.stop()
-
-    model_df["_target"] = y_converted
-
-    model_df = model_df.dropna(
-        subset=["_target"]
-    )
-
     feature_options = [
-        c for c in model_df.columns
-        if c not in [target_col, "_target"]
+        c for c in df.columns
+        if c != target_col
     ]
 
-    default_features = []
-
-    for key in ["나이", "성별", "혈당", "BMI", "혈압"]:
-
-        col = detected.get(key)
-
-        if (
-            col in feature_options
-            and col not in default_features
-        ):
-            default_features.append(col)
+    default_features = [
+        detected[key]
+        for key in ["나이", "혈당", "BMI", "혈압"]
+        if detected.get(key) in feature_options
+    ]
 
     if not default_features:
-        default_features = feature_options[:5]
+        default_features = feature_options[:4]
 
-    selected_features = st.multiselect(
-        "독립 변수로 사용할 속성을 선택하세요.",
+    selected_model_features = st.multiselect(
+        "모델의 독립 변수 선택",
         feature_options,
-        default=default_features
+        default=default_features,
+        key="model_features"
     )
 
     test_size = st.slider(
-        "시험용 데이터 비율(%)",
+        "시험용 데이터 비율 (%)",
         10,
         40,
         20,
@@ -627,85 +847,68 @@ with tab3:
     )
 
     random_seed = st.number_input(
-        "데이터 나누기 기준 숫자",
+        "데이터 분할 기준 숫자",
         min_value=0,
         max_value=9999,
         value=42
     )
 
     if st.button(
-        "모델 학습하고 평가하기",
+        "모델 학습 및 평가하기",
         type="primary"
     ):
 
-        if len(selected_features) == 0:
+        if not selected_model_features:
 
-            st.error("독립 변수를 한 개 이상 선택해 주세요.")
+            st.error("독립 변수를 선택해 주세요.")
 
-        elif model_df["_target"].nunique() != 2:
+        elif data["_target"].value_counts().min() < 2:
 
-            st.error(
-                "목표 컬럼에 정상과 당뇨병, "
-                "두 종류의 값이 모두 있어야 합니다."
-            )
-
-        elif model_df["_target"].value_counts().min() < 2:
-
-            st.error(
-                "각 목표값의 데이터가 최소 2개 이상 있어야 합니다."
-            )
+            st.error("각 집단에 데이터가 최소 2개 이상 필요합니다.")
 
         else:
 
-            X = model_df[selected_features].copy()
-            y = model_df["_target"].astype(int)
+            X = data[selected_model_features].copy()
+            y = data["_target"].copy()
 
             numeric_features = X.select_dtypes(
                 include=np.number
             ).columns.tolist()
 
             categorical_features = [
-                c for c in selected_features
+                c for c in selected_model_features
                 if c not in numeric_features
             ]
-
-            numeric_pipeline = Pipeline(steps=[
-                (
-                    "imputer",
-                    SimpleImputer(strategy="median")
-                ),
-                (
-                    "scaler",
-                    StandardScaler()
-                )
-            ])
-
-            categorical_pipeline = Pipeline(steps=[
-                (
-                    "imputer",
-                    SimpleImputer(strategy="most_frequent")
-                ),
-                (
-                    "onehot",
-                    OneHotEncoder(handle_unknown="ignore")
-                )
-            ])
 
             transformers = []
 
             if numeric_features:
+
+                numeric_pipeline = Pipeline([
+                    ("imputer", SimpleImputer(strategy="median")),
+                    ("scaler", StandardScaler())
+                ])
+
                 transformers.append(
                     ("num", numeric_pipeline, numeric_features)
                 )
 
             if categorical_features:
+
+                categorical_pipeline = Pipeline([
+                    (
+                        "imputer",
+                        SimpleImputer(strategy="most_frequent")
+                    ),
+                    (
+                        "onehot",
+                        OneHotEncoder(handle_unknown="ignore")
+                    )
+                ])
+
                 transformers.append(
                     ("cat", categorical_pipeline, categorical_features)
                 )
-
-            preprocessor = ColumnTransformer(
-                transformers=transformers
-            )
 
             try:
 
@@ -729,50 +932,43 @@ with tab3:
                 }
 
                 results = {}
-                fitted_pipelines = {}
+                saved_models = {}
 
-                for model_name, estimator in models.items():
+                for name, estimator in models.items():
 
-                    pipeline = Pipeline(steps=[
+                    pipeline = Pipeline([
                         (
                             "preprocess",
                             ColumnTransformer(
                                 transformers=transformers
                             )
                         ),
-                        (
-                            "model",
-                            estimator
-                        )
+                        ("model", estimator)
                     ])
 
                     pipeline.fit(X_train, y_train)
 
                     predictions = pipeline.predict(X_test)
 
-                    results[model_name] = {
+                    results[name] = {
                         "정확도": accuracy_score(
                             y_test, predictions
                         ),
-
                         "정밀도": precision_score(
                             y_test,
                             predictions,
                             zero_division=0
                         ),
-
                         "재현율": recall_score(
                             y_test,
                             predictions,
                             zero_division=0
                         ),
-
                         "F1 점수": f1_score(
                             y_test,
                             predictions,
                             zero_division=0
                         ),
-
                         "혼동행렬": confusion_matrix(
                             y_test,
                             predictions,
@@ -780,30 +976,27 @@ with tab3:
                         )
                     }
 
-                    fitted_pipelines[model_name] = pipeline
+                    saved_models[name] = pipeline
 
-                st.session_state["diabetes_model_results"] = results
-                st.session_state["diabetes_models"] = fitted_pipelines
-                st.session_state["diabetes_features"] = selected_features
-                st.session_state["diabetes_test_y"] = y_test
+                st.session_state["models"] = saved_models
+                st.session_state["results"] = results
+                st.session_state["features"] = selected_model_features
 
-                st.success("두 모델의 학습과 평가가 끝났습니다.")
+                st.success("모델 학습이 완료되었습니다.")
 
             except Exception as e:
 
-                st.error(
-                    f"모델을 학습하는 중 문제가 발생했습니다: {e}"
-                )
+                st.error(f"모델 학습 오류: {e}")
 
-    if "diabetes_model_results" in st.session_state:
-
-        results = st.session_state["diabetes_model_results"]
+    if "results" in st.session_state:
 
         st.subheader("모델 성능 비교")
 
+        results = st.session_state["results"]
+
         metric_table = pd.DataFrame({
             name: {
-                metric: values[metric]
+                metric: result[metric]
                 for metric in [
                     "정확도",
                     "정밀도",
@@ -811,7 +1004,7 @@ with tab3:
                     "F1 점수"
                 ]
             }
-            for name, values in results.items()
+            for name, result in results.items()
         })
 
         st.dataframe(
@@ -821,35 +1014,29 @@ with tab3:
 
         cols = st.columns(2)
 
-        for i, (name, values) in enumerate(results.items()):
+        for i, (name, result) in enumerate(results.items()):
 
             with cols[i]:
 
                 st.subheader(name)
 
-                cm = values["혼동행렬"]
+                cm = result["혼동행렬"]
 
-                cm_df = pd.DataFrame(
+                cm_table = pd.DataFrame(
                     cm,
                     index=["실제 정상", "실제 당뇨병"],
                     columns=["정상 예측", "당뇨병 예측"]
                 )
 
                 st.dataframe(
-                    cm_df,
+                    cm_table,
                     use_container_width=True
                 )
 
-                st.caption(
-                    f"정확도 {values['정확도']:.3f} · "
-                    f"정밀도 {values['정밀도']:.3f} · "
-                    f"재현율 {values['재현율']:.3f}"
-                )
-
         st.info(
-            "정확도: 전체 예측 중 실제 정답을 맞힌 비율\n\n"
+            "정확도: 전체 예측 중 정답을 맞힌 비율\n\n"
             "정밀도: 당뇨병이라고 예측한 사람 중 실제 당뇨병인 비율\n\n"
-            "재현율: 실제 당뇨병 환자 중 당뇨병이라고 찾아낸 비율"
+            "재현율: 실제 당뇨병 환자 중 올바르게 찾아낸 비율"
         )
 
 
@@ -859,22 +1046,22 @@ with tab3:
 
 with tab4:
 
-    st.header("4. 새로운 값으로 예측해 보기")
+    st.header("4. 직접 당뇨병 발병 여부 예측하기")
 
-    if "diabetes_models" not in st.session_state:
+    if "models" not in st.session_state:
 
         st.info(
-            "먼저 '분류 모델' 탭에서 모델을 학습해 주세요."
+            "먼저 분류 모델 탭에서 모델을 학습해 주세요."
         )
 
     else:
 
-        features = st.session_state["diabetes_features"]
-        models = st.session_state["diabetes_models"]
+        features = st.session_state["features"]
+        models = st.session_state["models"]
 
         st.write(
-            "아래에 건강검진 값을 입력하면 "
-            "학습한 모델의 예측 결과를 확인할 수 있습니다."
+            "건강검진 값을 입력하면 "
+            "두 모델이 당뇨병 발병 여부를 예측합니다."
         )
 
         input_values = {}
@@ -885,52 +1072,52 @@ with tab4:
 
             if pd.api.types.is_numeric_dtype(series):
 
-                numeric_series = pd.to_numeric(
+                values = pd.to_numeric(
                     series,
                     errors="coerce"
                 )
 
-                median = numeric_series.median()
+                median = values.median()
 
                 if pd.isna(median):
                     median = 0.0
 
-                min_val = numeric_series.min()
-                max_val = numeric_series.max()
+                min_value = values.min()
+                max_value = values.max()
 
                 if (
-                    pd.isna(min_val)
-                    or pd.isna(max_val)
-                    or min_val == max_val
+                    pd.isna(min_value)
+                    or pd.isna(max_value)
+                    or min_value == max_value
                 ):
-                    min_val = float(median) - 1
-                    max_val = float(median) + 1
+                    min_value = float(median) - 1
+                    max_value = float(median) + 1
 
                 input_values[col] = st.number_input(
                     col,
-                    min_value=float(min_val),
-                    max_value=float(max_val),
+                    min_value=float(min_value),
+                    max_value=float(max_value),
                     value=float(median),
-                    key=f"prediction_{col}"
+                    key=f"input_{col}"
                 )
 
             else:
 
                 options = sorted(
-                    series.dropna().astype(str).unique().tolist()
+                    series.dropna().astype(str).unique()
                 )
 
                 if not options:
-                    options = ["알 수 없음"]
+                    options = ["정보 없음"]
 
                 input_values[col] = st.selectbox(
                     col,
                     options,
-                    key=f"prediction_{col}"
+                    key=f"input_{col}"
                 )
 
         if st.button(
-            "당뇨병 발병 여부 예측",
+            "당뇨병 발병 여부 예측하기",
             type="primary"
         ):
 
@@ -939,7 +1126,7 @@ with tab4:
                 columns=features
             )
 
-            prediction_cols = st.columns(2)
+            cols = st.columns(2)
 
             for i, (name, pipeline) in enumerate(models.items()):
 
@@ -947,42 +1134,41 @@ with tab4:
                     pipeline.predict(sample)[0]
                 )
 
-                with prediction_cols[i]:
+                with cols[i]:
 
                     st.subheader(name)
 
                     if prediction == 1:
+
                         st.error("당뇨병으로 예측했습니다.")
 
                     else:
+
                         st.success("정상으로 예측했습니다.")
 
-                    if hasattr(pipeline, "predict_proba"):
+                    probability = pipeline.predict_proba(
+                        sample
+                    )[0][1]
 
-                        probability = pipeline.predict_proba(
-                            sample
-                        )[0][1]
-
-                        st.metric(
-                            "당뇨병으로 예측한 확률",
-                            f"{probability * 100:.1f}%"
-                        )
+                    st.metric(
+                        "당뇨병 예측 확률",
+                        f"{probability * 100:.1f}%"
+                    )
 
         st.warning(
-            "이 결과는 교육 및 실습용 예측이며, "
-            "의학적 진단이나 검사 결과를 대신할 수 없습니다. "
-            "건강 상태가 걱정된다면 의료 전문가와 상담하세요."
+            "이 모델은 교육 및 실습용입니다. "
+            "실제 의료 진단을 대신할 수 없습니다."
         )
 
 
 # --------------------------------------------------
-# 하단 안내
+# 하단
 # --------------------------------------------------
 
 st.divider()
 
 st.caption(
-    "데이터 출처: Kaggle - Diabetes Dataset "
-    "(Ehab Aboelnaga). "
-    "실제 CSV의 컬럼 구성을 확인해 주세요."
+    "데이터 출처: Kaggle Diabetes Dataset. "
+    "분석 결과는 제공된 데이터에 근거한 통계이며 "
+    "의학적 진단 결과가 아닙니다."
 )
